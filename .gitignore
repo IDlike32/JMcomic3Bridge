@@ -1,0 +1,27 @@
+# Runtime data (settings, SQLite DBs, image cache)
+data/
+
+# Runtime logs
+.srv.out
+.srv.err
+
+# Screenshots / test captures
+.shots/
+
+# One-off protocol probe dumps
+bat.bin
+pg.bin
+hdr.txt
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Node
+node_modules/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
