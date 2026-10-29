@@ -445,7 +445,10 @@ export function coverCanvas(src, options) {
   holder.__cancel = () => {
     finished = true;
     if (observer) observer.disconnect();
+    observer = null;
     coverBatch.forget(tile);
+    img.onload = null;
+    img.onerror = null;
     img.removeAttribute("src");
   };
   return holder;
@@ -617,7 +620,9 @@ export function section(title, options) {
 
 export function skeletonTile() {
   return el("div", { class: "sk-tile" }, [
-    el("div", { class: "skeleton cover" }),
+    el("div", { class: "skeleton cover jm-skeleton-cover" }, [
+      ...Array.from({ length: 9 }, () => el("i", { class: "jm-manga-panel" })),
+    ]),
     el("div", { class: "skeleton line" }),
     el("div", { class: "skeleton line short" }),
   ]);
@@ -637,10 +642,44 @@ export function skeletonRail(count) {
   return el("div", { class: "rail" }, kids);
 }
 
-export function loadingRow(text) {
+export function loadingAnimation(type, label) {
+  const kind = type || "manga";
+  const nodes = [];
+  if (kind === "cover") {
+    nodes.push(el("div", { class: "jm-loader jm-loader-cover", role: "presentation" }, [
+      el("div", { class: "jm-book-cover" }),
+      el("i", { class: "jm-book-page" }),
+      el("i", { class: "jm-book-page" }),
+      el("i", { class: "jm-book-page" }),
+    ]));
+  } else if (kind === "catalog") {
+    nodes.push(el("div", { class: "jm-loader jm-loader-catalog", role: "presentation" }, [
+      ...Array.from({ length: 6 }, () => el("i", { class: "jm-shelf-book" })),
+      el("div", { class: "jm-shelf" }),
+    ]));
+  } else if (kind === "detail") {
+    nodes.push(el("div", { class: "jm-loader jm-loader-detail", role: "presentation" }, [
+      ...Array.from({ length: 4 }, () => el("i", { class: "jm-info-card" })),
+    ]));
+  } else if (kind === "chapter") {
+    nodes.push(el("div", { class: "jm-loader jm-loader-chapter", role: "presentation" }, [
+      el("i", { class: "jm-page-left" }),
+      el("i", { class: "jm-page-right" }),
+    ]));
+  } else {
+    nodes.push(el("div", { class: "jm-loader jm-loader-manga", role: "presentation" }, [
+      ...Array.from({ length: 9 }, () => el("i", { class: "jm-manga-panel" })),
+    ]));
+  }
+  return el("div", { class: "jm-loading", role: "status" }, [
+    ...nodes,
+    label ? el("span", { class: "jm-loading-label", text: label }) : null,
+  ]);
+}
+
+export function loadingRow(text, type) {
   return el("div", { class: "loading-row" }, [
-    el("span", { class: "spinner" }),
-    el("span", { text: text || "加载中…" }),
+    loadingAnimation(type || "manga", text || "加载中…"),
   ]);
 }
 

@@ -6,7 +6,7 @@ import { state, setTheme, saveSettings, refreshLines } from "../state.js";
 const VERSION_FALLBACK = "1.0.0";
 
 export async function renderMe(view) {
-  view.appendChild(loadingRow("加载中…"));
+  view.appendChild(loadingRow("加载中…", "detail"));
 
   // Every block is independent: a dead cache query must not hide the theme switch.
   const [library, cache, tasks, health] = await Promise.all([

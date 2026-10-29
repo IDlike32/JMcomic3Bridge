@@ -54,10 +54,10 @@ export const api = {
   promoteList: (id, page) => jsonFetch("/api/promote/list" + qs({ id, page: page || 1 })),
 
   // ---- search ----
-  search: (q, page, o) => jsonFetch("/api/search" + qs({ q, page: page || 1, o: o || "mr" })),
-  searchFull: (q, o, maxPages) =>
-    jsonFetch("/api/search/full" + qs({ q, o: o || "mr", max_pages: maxPages || 0 })),
-  searchStreamUrl: (q, o) => "/api/search/stream" + qs({ q, o: o || "mr" }),
+  search: (q, page, o, searchType, conditions) => jsonFetch("/api/search" + qs({ q, page: page || 1, o: o || "mr", search_type: searchType || "site", conditions: conditions ? JSON.stringify(conditions) : "" })),
+  searchFull: (q, o, maxPages, searchType) =>
+    jsonFetch("/api/search/full" + qs({ q, o: o || "mr", search_type: searchType || "site", max_pages: maxPages || 0 })),
+  searchStreamUrl: (q, o, searchType) => "/api/search/stream" + qs({ q, o: o || "mr", search_type: searchType || "site" }),
 
   // ---- album / chapter ----
   album: (aid) => jsonFetch("/api/album/" + encodeURIComponent(aid)),
@@ -155,6 +155,10 @@ export const api = {
     }),
   downloadUrl: (cid, title) =>
     "/api/download/" + encodeURIComponent(cid) + qs({ title: title || "" }),
+  zipPageUrl: (cid, title) => "/download.html" + qs({ cid, title: title || "" }),
+  zipJobStart: (cid, title) => postJson("/api/zip/jobs", { cid, title: title || "" }),
+  zipJob: (id) => jsonFetch("/api/zip/jobs/" + encodeURIComponent(id)),
+  zipFileUrl: (id) => "/api/zip/jobs/" + encodeURIComponent(id) + "/file",
 };
 
 // ---- formatting helpers (pure) ----

@@ -192,6 +192,10 @@ export function createFlow(options) {
     const img = el("img", { class: "rpage-img", alt: "第 " + pageNo + " 页", decoding: "async" });
     const label = el("span", { class: "pct", text: VISUAL_TEXT.idle });
     const box = el("div", { class: "ph" }, [
+      el("div", { class: "jm-loader jm-loader-chapter" }, [
+        el("i", { class: "jm-page-left" }),
+        el("i", { class: "jm-page-right" }),
+      ]),
       el("span", { class: "num", text: String(pageNo) }),
       el("span", { class: "st-dot", "aria-hidden": "true" }),
       label,

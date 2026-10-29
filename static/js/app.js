@@ -15,6 +15,7 @@
 import { el, icon, resetCoverStream, resumeCovers, errorState } from "./ui.js";
 import { resetEvents, setSuspended } from "./events.js";
 import { state, bootstrap, refreshLines, setTheme } from "./state.js";
+import { installTabSwipe } from "./swipe.js";
 
 const view = document.getElementById("view");
 const lineDots = document.getElementById("line-dots");
@@ -182,6 +183,10 @@ function rekey(entry, key) {
   frames.set(key, entry);
 }
 
+// Declared above route(): route() reads the pending direction on every navigation.
+let swipeOffset = 0;
+let swipePending = 0;   // -1 back, +1 forward, 0 none: the direction a new frame enters from
+
 function route() {
   const key = normalizeHash(location.hash);
   closeDetail();
@@ -198,6 +203,73 @@ function route() {
   if (!entry) entry = makeFrame(key);
   activate(entry);
   if (leaving && leaving !== entry) drop(leaving);
+  if (swipePending) {
+    const dir = swipePending;
+    swipePending = 0;
+    applyEnter(entry, dir);
+  }
+}
+
+// ---------------------------------------------------------------- tab swipe
+//
+// A frame cannot navigate the app, and it is the only thing that sees the
+// finger. So it reports the gesture and the shell decides: drag the frame with
+// the finger, then either commit to the neighbouring tab or spring back.
+
+function tabNeighbour(dir) {
+  const order = NAV_HEADS;
+  const index = order.indexOf(headOf(location.hash));
+  if (index < 0) return null;
+  const next = order[index + (dir === "next" ? 1 : -1)];
+  return next || null;
+}
+
+function paintSwipe(dx) {
+  if (!activeFrame) return;
+  const node = activeFrame.frame;
+  const limit = Math.min(120, window.innerWidth * 0.28);
+  swipeOffset = Math.max(-limit, Math.min(limit, dx * 0.32));
+  node.classList.toggle("swiping", Math.abs(swipeOffset) > 0.5);
+  node.style.transform = swipeOffset ? "translate3d(" + swipeOffset + "px,0,0)" : "";
+}
+
+function settleSwipe() {
+  if (!activeFrame) return;
+  const node = activeFrame.frame;
+  node.classList.remove("swiping");
+  node.classList.add("settling");
+  node.style.transform = "";
+  setTimeout(() => node.classList.remove("settling"), 320);
+  swipeOffset = 0;
+}
+
+function applyEnter(entry, dir) {
+  const node = entry.frame;
+  node.classList.remove("enter-fwd", "enter-back");
+  if (!dir) return;
+  // Restart the animation even when the same class was used a moment ago.
+  void node.offsetWidth;
+  node.classList.add(dir > 0 ? "enter-fwd" : "enter-back");
+  setTimeout(() => node.classList.remove("enter-fwd", "enter-back"), 420);
+}
+
+function handleSwipe(source, data) {
+  const entry = entryFor(source);
+  if (!entry || entry !== activeFrame) return;
+  if (data.type === "swipe-move") {
+    if (data.cancel) settleSwipe();
+    else paintSwipe(Number(data.dx) || 0);
+    return;
+  }
+  if (data.type !== "swipe") return;
+  const target = tabNeighbour(data.dir);
+  if (!target) {
+    settleSwipe();
+    return;
+  }
+  swipePending = data.dir === "next" ? 1 : -1;
+  settleSwipe();
+  location.hash = "#/" + target;
 }
 
 function entryFor(source) {
@@ -212,6 +284,10 @@ function onHostMessage(evt) {
   if (evt.origin !== location.origin) return;
   const data = evt.data;
   if (!data || typeof data !== "object") return;
+  if (data.type === "swipe" || data.type === "swipe-move") {
+    handleSwipe(evt.source, data);
+    return;
+  }
   if (detailFrame && evt.source === detailFrame.contentWindow) {
     if ((data.type === "detail" || data.type === "detail-next" || data.type === "detail-replace") && typeof data.aid === "string" && data.aid) {
       const nextAid = String(data.aid);
@@ -345,7 +421,15 @@ function closeDetail() {
 
 function bootShell() {
   view.className = "stage";
-  loadingNode = el("div", { class: "stage-loading" }, [el("span", { class: "spinner" })]);
+  loadingNode = el("div", { class: "stage-loading" }, [
+    el("div", { class: "jm-loading jm-loading-stage", role: "status" }, [
+      el("div", { class: "jm-loader jm-loader-chapter" }, [
+        el("i", { class: "jm-page-left" }),
+        el("i", { class: "jm-page-right" }),
+      ]),
+      el("span", { class: "jm-loading-label", text: "正在翻开页面…" }),
+    ]),
+  ]);
   view.appendChild(loadingNode);
 
   window.addEventListener("hashchange", route);
@@ -414,6 +498,9 @@ async function renderRoute() {
     view.innerHTML = "";
     view.appendChild(el("div", { class: "panel reader-loading", style: "min-height:50vh;display:grid;place-items:center" }, [
       el("div", { class: "muted", text: "正在打开阅读器…" }),
+      el("div", { class: "jm-loader jm-loader-chapter", "aria-hidden": "true" }, [
+        el("i", { class: "jm-page-left" }), el("i", { class: "jm-page-right" }),
+      ]),
     ]));
     try {
       const { openReader } = await import("./views/reader/index.js");
@@ -557,6 +644,13 @@ function bootEmbed() {
 
   // Wait for the first paint before listening for input, so a queued message cannot
   // arrive at a router that has not started.
+  // Sideways drag between tabs. The reader, a sheet, or a horizontal scroller keeps
+  // the gesture for itself, so this never steals a rail scroll.
+  installTabSwipe({
+    send: postHost,
+    blocked: () => !!activeReader || !!document.querySelector(".sheet, .backdrop, .detail-panel, [role=dialog]"),
+  });
+
   renderRoute().then(() => {
     postHost({ type: "ready" });
     requestAnimationFrame(() => requestAnimationFrame(() => {

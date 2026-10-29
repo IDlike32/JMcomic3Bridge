@@ -325,7 +325,7 @@ export async function renderCache(view, ctx) {
       offset = 0;
       visibleBooks = BOOK_PAGE_SIZE;
       listHost.innerHTML = "";
-      listHost.appendChild(loadingRow("读取缓存列表…"));
+      listHost.appendChild(loadingRow("读取缓存列表…", "catalog"));
     }
     try {
       const currentKind = kind;
@@ -389,6 +389,6 @@ export async function renderCache(view, ctx) {
   }
 
   paintActions();
-  summaryHost.appendChild(loadingRow("读取缓存…"));
+  summaryHost.appendChild(loadingRow("读取缓存…", "catalog"));
   await reload();
 }

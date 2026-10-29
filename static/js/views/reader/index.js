@@ -3,7 +3,7 @@
 // One scrolling surface, virtualised pages (flow.js), a chrome that fades out of
 // the way, and a background download task that keeps the next pages ready.
 import { api } from "../../api.js";
-import { el, icon, toast, openSheet, segControl, isUnsupported } from "../../ui.js";
+import { el, icon, toast, openSheet, segControl, isUnsupported, loadingAnimation } from "../../ui.js";
 import { onEvent } from "../../events.js";
 import { loadPrefs, savePrefs } from "./prefs.js";
 import { createFlow } from "./flow.js";
@@ -37,8 +37,7 @@ export async function openReader(cid, aid) {
     ]),
   ]));
   openingRoot.appendChild(el("div", { class: "reader-opening", role: "status" }, [
-    el("span", { class: "spinner" }),
-    el("div", { text: "正在连接漫画线路" }),
+    loadingAnimation("cover", "正在连接漫画线路"),
     el("div", { class: "muted tiny", text: "目录响应后会立即开始载入页面" }),
   ]));
   document.body.appendChild(openingRoot);
@@ -763,6 +762,33 @@ export async function openReader(cid, aid) {
   function onPageHide() {
     reporter.flush(flow.currentPage());
   }
+
+  // Sideways swipe flips chapters, like a native reader. Only at 1x zoom: once the
+  // page is wider than the screen a horizontal drag is the user panning the artwork.
+  let swipeStart = null;
+  function canSwipeChapter() {
+    if (drawerOpen || tipOpen) return false;
+    if (document.querySelector(".sheet, .backdrop")) return false;
+    return (prefs.zoom || 1) <= 1.02;
+  }
+  scroller.addEventListener("touchstart", (evt) => {
+    swipeStart = evt.touches && evt.touches.length === 1 && canSwipeChapter()
+      ? { x: evt.touches[0].clientX, y: evt.touches[0].clientY, t: Date.now() }
+      : null;
+  }, { passive: true });
+  scroller.addEventListener("touchend", (evt) => {
+    if (!swipeStart) return;
+    const touch = (evt.changedTouches && evt.changedTouches[0]) || swipeStart;
+    const dx = touch.clientX - swipeStart.x;
+    const dy = touch.clientY - swipeStart.y;
+    const dt = Date.now() - swipeStart.t;
+    swipeStart = null;
+    if (dt > 800 || Math.abs(dx) < 70) return;
+    if (Math.abs(dx) < Math.abs(dy) * 1.6) return;
+    if (dx < 0) goChapter(neighbors.next);
+    else goChapter(neighbors.prev);
+  }, { passive: true });
+  scroller.addEventListener("touchcancel", () => { swipeStart = null; }, { passive: true });
 
   scroller.addEventListener("click", onScrollerClick);
   document.addEventListener("keydown", keyHandler);

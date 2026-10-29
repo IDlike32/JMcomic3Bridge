@@ -10,6 +10,21 @@ const CHUNK = 200;
 const TAG_PREVIEW = 16;
 const DETAIL_OVERLAY = new URLSearchParams(location.search).get("overlay") === "detail";
 
+function metadataValues(value) {
+  const values = Array.isArray(value) ? value : [value];
+  return Array.from(new Set(values.flatMap((item) => {
+    if (item && typeof item === "object") return [item.name || item.title || item.text || ""];
+    return String(item == null ? "" : item).split(/[，、,\n]+/);
+  }).map((item) => String(item).trim()).filter((item) => item && !/^n\/?a$/i.test(item))));
+}
+
+function openZipPage(cid, title) {
+  const url = api.zipPageUrl(cid, title);
+  const win = window.open(url, "_blank");
+  if (win) win.opener = null;
+  else location.href = url;
+}
+
 export async function renderAlbum(view, ctx) {
   const aid = String((ctx && ctx.rest && ctx.rest[0]) || "");
   if (!aid) {
@@ -41,10 +56,8 @@ export async function renderAlbum(view, ctx) {
   view.innerHTML = "";
 
   // Upstream uses "N/A" as an author placeholder; showing it is worse than hiding it.
-  const authors = (Array.isArray(album.author) ? album.author : [album.author])
-    .map((name) => String(name == null ? "" : name).trim())
-    .filter((name) => name && !/^n\/?a$/i.test(name))
-    .join(" / ");
+  const authors = metadataValues(album.author || album.authors || album.artist);
+  const actors = metadataValues(album.actors || album.characters || album.character || album.cast);
   const chapters = chapterList(album, aid);
   const progressByCid = new Map(
     (progress.items || []).map((row) => [String(row.cid), row])
@@ -69,7 +82,7 @@ export async function renderAlbum(view, ctx) {
     chapterPanelNode = null;
   }
 
-  view.appendChild(hero(album, aid, authors));
+  view.appendChild(hero(album, aid, authors, actors));
   view.appendChild(actionBar());
   const description = descriptionBlock(album.description);
   if (description) view.appendChild(description);
@@ -133,9 +146,7 @@ export async function renderAlbum(view, ctx) {
       icon("download"),
       el("span", { text: "ZIP" }),
     ]);
-    zip.addEventListener("click", () => {
-      window.open(api.downloadUrl(primaryCid, album.name || ""), "_blank");
-    });
+    zip.addEventListener("click", () => openZipPage(primaryCid, album.name || ""));
 
     const more = iconButton("more", openMore, { title: "更多操作" });
 
@@ -285,7 +296,7 @@ export async function renderAlbum(view, ctx) {
     return node;
   }
 
-  function hero(data, albumId, authorLine) {
+  function hero(data, albumId, authorLine, actorList) {
     const bg = el("div", {
       style: "position:absolute;inset:-30px;background-image:url('" + api.coverUrl(albumId, 640) +
         "');background-size:cover;background-position:center;filter:blur(26px) saturate(1.15);opacity:.5",
@@ -331,7 +342,8 @@ export async function renderAlbum(view, ctx) {
         el("div", { class: "grow hero-info" }, [
           el("h1", { text: data.name || "(无标题)", style: "font-size:19px;line-height:1.35" }),
           el("div", { class: "row wrap muted tiny", style: "gap:12px;margin-top:4px" }, [
-            authorLine ? el("span", { text: authorLine }) : null,
+            authorLine.length ? metadataLinks("作者", authorLine, "author") : null,
+            actorList.length ? metadataLinks("出场人物", actorList, "character") : null,
             el("span", { text: "車牌號：" + albumId }),
           ]),
           stats,
@@ -341,12 +353,22 @@ export async function renderAlbum(view, ctx) {
     ]);
   }
 
+  function metadataLinks(label, values, type) {
+    return el("div", { class: "detail-meta-links row wrap", style: "gap:6px;align-items:center" }, [
+      el("span", { class: "muted tiny", text: label + "：" }),
+      ...values.map((value) => el("button", {
+        class: "chip",
+        type: "button",
+        text: value,
+        onClick: () => { location.hash = "#/search?q=" + encodeURIComponent(value) + "&search_type=" + type; },
+      })),
+    ]);
+  }
+
   function tagBox(tags) {
     // Upstream rows can carry whitespace-only or duplicated tags; those render as
     // empty pills, so normalise before drawing.
-    const list = Array.from(new Set((tags || [])
-      .map((tag) => String(tag == null ? "" : tag).trim())
-      .filter(Boolean)));
+    const list = metadataValues(tags);
     if (!list.length) return null;
     const box = el("div", { class: "chips", style: "margin-top:10px" });
     let opened = false;
@@ -358,7 +380,7 @@ export async function renderAlbum(view, ctx) {
           class: "chip",
           type: "button",
           text: tag,
-          onClick: () => { location.hash = "#/search?q=" + encodeURIComponent(tag); },
+          onClick: () => { location.hash = "#/search?q=" + encodeURIComponent(tag) + "&search_type=tag"; },
         }));
       });
       if (!opened && list.length > TAG_PREVIEW) {
@@ -480,7 +502,7 @@ function albumSkeleton() {
         el("div", { class: "skeleton", style: "height:12px;width:55%" }),
       ]),
     ]),
-    loadingRow("加载详情…"),
+    loadingRow("加载详情…", "detail"),
     skeletonRail(4),
   ]);
 }

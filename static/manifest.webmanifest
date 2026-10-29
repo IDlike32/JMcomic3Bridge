@@ -3,8 +3,8 @@
   "short_name": "JMBridge",
   "start_url": "/#/home",
   "display": "standalone",
-  "background_color": "#0d0f13",
-  "theme_color": "#0d0f13",
+  "background_color": "#0b1012",
+  "theme_color": "#0b1012",
   "orientation": "any",
   "icons": [
     { "src": "/logo192.png", "sizes": "192x192", "type": "image/png" },

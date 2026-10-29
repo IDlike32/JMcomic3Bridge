@@ -6,6 +6,7 @@ import io
 import json
 import threading
 import time
+import uuid
 from urllib.parse import quote
 from pathlib import Path
 
@@ -32,7 +33,7 @@ cache = Cache(settings)
 library = Library(settings.data_dir)
 cache.eviction_context = library.cache_eviction_context
 hub = Hub()
-app = FastAPI(title="JMBridge", version="1.0.0")
+app = FastAPI(title="JMBridge", version="1.1.0")
 _zip_jobs = {}
 _zip_jobs_lock = threading.Lock()
 
@@ -41,36 +42,84 @@ def _zip_job_snapshot(job):
     return {key: value for key, value in job.items() if key != "data"}
 
 
+ZIP_JOB_TTL = 30 * 60
+
+
+def _prune_zip_jobs(now):
+    """Drop jobs idle longer than ZIP_JOB_TTL. Caller holds _zip_jobs_lock."""
+    for key in [k for k, job in _zip_jobs.items() if now - job.get("updated", now) > ZIP_JOB_TTL]:
+        _zip_jobs.pop(key, None)
+
+
+def _cached_page_bytes(cid, page_no, compression):
+    """Read the configured page cache, accepting compatible older compression tiers."""
+    exact = _page_key(cid, page_no, compression)
+    data = cache.get_bytes("pages", exact)
+    if data is not None:
+        return data
+    prefix = "{}|{}|".format(cid, page_no)
+    for entry in cache.list_prefix("pages", prefix):
+        key = entry.get("key", "")
+        if key.startswith(prefix) and key.endswith("|v" + DESC_VERSION):
+            data = cache.get_bytes("pages", key)
+            if data is not None:
+                return data
+    return None
+
+
 def _run_zip_job(job_id, cid, title):
+    def publish(**fields):
+        with _zip_jobs_lock:
+            job = _zip_jobs.get(job_id)
+            if job is not None:
+                job.update(fields)
+                job["updated"] = time.time()
+
     try:
-        meta = cache.get_json("search", "read|{}".format(cid)) or {}
-        name = title or meta.get("name") or cid
-        pages = _page_urls(meta)
-        with _zip_jobs_lock:
-            job = _zip_jobs[job_id]
-            job.update({"total": len(pages), "state": "downloading"})
-        collected = []
-        for page in _collect_pages(cid, lossless=True, compression="none"):
-            collected.append(page)
-            with _zip_jobs_lock:
-                job["done"] = len(collected)
-                job["progress"] = round(len(collected) / len(pages), 4) if pages else 0
-        if not collected:
-            raise RuntimeError("没有下载到可用页面")
-        with _zip_jobs_lock:
-            _zip_jobs[job_id]["state"] = "packing"
-        buf = archive.build_zip(collected, album_title=name, archive_name=name, lossless=True)
-        data = buf.getvalue()
+        payload = _read_payload(cid)
+        name = title or payload.get("name") or cid
+        pages = _page_urls(payload)
+        total = len(pages)
+        compression = settings.get("cache_compression") or "minimal"
+        publish(state="downloading", total=total)
+
+        # Use the same scheduler/lanes/cache as the reader. Existing page bytes are
+        # marked done before the scheduler starts so cached chapters are not refetched.
+        _spawn_task(cid, title=name, foreground=True)
+        task = tasks.get(cid)
+        if task is None:
+            raise RuntimeError("缓存下载任务未能启动")
+        while True:
+            snapshot = task.to_dict()
+            done = snapshot.get("done", 0)
+            failed = snapshot.get("failed", 0)
+            publish(done=done, progress=round(done / total, 4) if total else 0.0)
+            if snapshot.get("state") == "done" or (snapshot.get("total", 0) and done + failed >= total):
+                if failed:
+                    raise RuntimeError("有 {} 页缓存失败，请在任务中心重试".format(failed))
+                break
+            time.sleep(0.4)
+
+        publish(state="packing", done=0, progress=0.0)
+        def cached_pages():
+            for index, item in enumerate(pages, start=1):
+                page_no = int(item.get("page") or index)
+                page_data = _cached_page_bytes(cid, page_no, compression)
+                if page_data is None:
+                    raise RuntimeError("第 {} 页缓存未完成".format(page_no))
+                publish(done=index, progress=round(index / total, 4) if total else 0.0)
+                yield (page_no, page_stem(item.get("url") or str(page_no)), page_data, None, False)
+
+        if not pages:
+            raise RuntimeError("没有可打包的缓存页面")
+        data = archive.build_zip(cached_pages(), album_title=name, archive_name=name,
+                                 lossless=True).getvalue()
         cache.put_bytes("zip", "{}|download".format(cid), data,
-                        {"kind": "download", "cid": cid, "title": name, "pages": len(collected)})
-        with _zip_jobs_lock:
-            _zip_jobs[job_id].update({"state": "done", "progress": 1.0,
-                                      "done": len(collected), "data": data,
-                                      "filename": archive.safe_name(name, cid) + ".zip"})
+                        {"kind": "download", "cid": cid, "title": name, "pages": len(pages)})
+        publish(state="done", progress=1.0, done=len(pages), data=data, bytes=len(data),
+                filename=archive.safe_name(name, cid) + ".zip")
     except Exception as exc:
-        with _zip_jobs_lock:
-            if job_id in _zip_jobs:
-                _zip_jobs[job_id].update({"state": "failed", "error": str(exc) or "打包失败"})
+        publish(state="failed", error=str(exc) or "打包失败")
 
 
 @app.exception_handler(JMBusy)
@@ -180,7 +229,7 @@ async def _startup():
 
 @app.get("/api/health")
 def health():
-    return _ok({"version": "1.0.0", "lines": pool.snapshot(), "cache": cache.stats()})
+    return _ok({"version": "1.1.0", "lines": pool.snapshot(), "cache": cache.stats()})
 
 
 @app.get("/api/lines")
@@ -244,8 +293,8 @@ def promote_list(id: str = Query(""), page: int = Query(1)):
 
 # ------------------------------------------------------------------ search
 
-def _search_fetch(query: str, page: int, order: str) -> dict:
-    params = {"search_query": query, "page": page, "o": order}
+def _search_fetch(query: str, page: int, order: str, search_type: str = "site") -> dict:
+    params = {"search_query": query, "page": page, "o": order, "search_type": search_type}
     data = _client().get("search", params)
     if isinstance(data, list):
         list_items = data
@@ -261,14 +310,15 @@ def _search_fetch(query: str, page: int, order: str) -> dict:
 
 @app.get("/api/search")
 def search(q: str = Query(..., min_length=1), page: int = Query(1), o: str = Query("mr"),
-           refresh: bool = Query(False)):
-    key = "{}|{}|{}|{}".format(q, page, o, settings.get("lang"))
+           search_type: str = Query("site"), refresh: bool = Query(False)):
+    search_type = search_type if search_type in {"site", "work", "author", "tag", "character"} else "site"
+    key = "{}|{}|{}|{}|{}".format(q, page, o, search_type, settings.get("lang"))
     if not refresh:
         hit = cache.get_json("search", key)
         if hit:
             return _ok(hit, cached=True)
-    result = _search_fetch(q, page, o)
-    cache.put_json("search", key, result, {"kind": "search", "q": q, "page": page})
+    result = _search_fetch(q, page, o, search_type)
+    cache.put_json("search", key, result, {"kind": "search", "q": q, "page": page, "search_type": search_type})
     return _ok(result, cached=False)
 
 
@@ -278,8 +328,10 @@ def _sse(event: str, data) -> str:
 
 @app.get("/api/search/stream")
 async def search_stream(q: str = Query(..., min_length=1), o: str = Query("mr"),
-                        pages: int = Query(6), full: bool = Query(False)):
+                        search_type: str = Query("site"), pages: int = Query(6), full: bool = Query(False)):
     """Stream results page by page so the UI can render as data arrives."""
+
+    search_type = search_type if search_type in {"site", "work", "author", "tag", "character"} else "site"
 
     async def gen():
         loop = asyncio.get_running_loop()
@@ -290,17 +342,17 @@ async def search_stream(q: str = Query(..., min_length=1), o: str = Query("mr"),
         while True:
             if not full and page > pages:
                 break
-            key = "{}|{}|{}|{}".format(q, page, o, settings.get("lang"))
+            key = "{}|{}|{}|{}|{}".format(q, page, o, search_type, settings.get("lang"))
             cached = cache.get_json("search", key)
             if cached:
                 result = cached
             else:
                 try:
-                    result = await loop.run_in_executor(None, _search_fetch, q, page, o)
+                    result = await loop.run_in_executor(None, _search_fetch, q, page, o, search_type)
                 except Exception as exc:
                     yield _sse("error", {"page": page, "message": str(exc)})
                     break
-                cache.put_json("search", key, result, {"kind": "search", "q": q, "page": page})
+                cache.put_json("search", key, result, {"kind": "search", "q": q, "page": page, "search_type": search_type})
 
             items = [it for it in result.get("items", []) if it.get("id") not in emitted]
             for it in items:
@@ -324,26 +376,28 @@ async def search_stream(q: str = Query(..., min_length=1), o: str = Query("mr"),
 
 @app.get("/api/search/full")
 def search_full(q: str = Query(..., min_length=1), o: str = Query("mr"),
-                max_pages: int = Query(0), refresh: bool = Query(False)):
+                search_type: str = Query("site"), refresh: bool = Query(False)):
     """Full-result search, persisted to the search cache."""
-    key = "full|{}|{}|{}".format(q, o, settings.get("lang"))
+    search_type = search_type if search_type in {"site", "work", "author", "tag", "character"} else "site"
+    key = "full|{}|{}|{}|{}".format(q, o, search_type, settings.get("lang"))
     if not refresh:
         hit = cache.get_json("search", key)
         if hit:
             return _ok(hit, cached=True)
 
-    seen, items, page = set(), [], 1
+    seen, items, page, fetched_pages = set(), [], 1, 0
+    failed = False
     while True:
-        if max_pages and page > max_pages:
-            break
-        page_key = "{}|{}|{}|{}".format(q, page, o, settings.get("lang"))
+        page_key = "{}|{}|{}|{}|{}".format(q, page, o, search_type, settings.get("lang"))
         result = None if refresh else cache.get_json("search", page_key)
         if not result:
             try:
-                result = _search_fetch(q, page, o)
+                result = _search_fetch(q, page, o, search_type)
             except Exception:
+                failed = True
                 break
-            cache.put_json("search", page_key, result, {"kind": "search", "q": q, "page": page})
+            cache.put_json("search", page_key, result, {"kind": "search", "q": q, "page": page, "search_type": search_type})
+        fetched_pages += 1
         fresh = 0
         for it in result.get("items", []):
             if it.get("id") not in seen:
@@ -358,11 +412,9 @@ def search_full(q: str = Query(..., min_length=1), o: str = Query("mr"),
         if not result.get("items"):
             break
         page += 1
-        if page > 400:
-            break
 
-    payload = {"query": q, "order": o, "items": items, "pages": page, "total": len(items),
-               "fetched_at": time.time()}
+    payload = {"query": q, "order": o, "items": items, "pages": fetched_pages, "total": len(items),
+               "fetched_at": time.time(), "partial": failed}
     cache.put_json("search", key, payload, {"kind": "search", "q": q, "full": True})
     return _ok(payload, cached=False)
 
@@ -908,13 +960,19 @@ async def pages_stream(cid: str, aid: str = Query(""), scramble: str = Query("")
 
 # ------------------------------------------------------------------ download / cache
 
+def _read_payload(cid: str, client=None) -> dict:
+    key = "read|{}".format(cid)
+    payload = cache.get_json("search", key)
+    if payload is None:
+        payload = (client or _client()).get("comic_read", {"id": cid})
+        cache.put_json("search", key, payload, {"kind": "read", "cid": cid})
+    return payload
+
+
 def _collect_pages(cid: str, lossless: bool, compression: str):
     """Yield (index, filename, raw_bytes, pil_image_or_None) for a chapter."""
     client = _client()
-    read_payload = cache.get_json("search", "read|{}".format(cid))
-    if read_payload is None:
-        read_payload = client.get("comic_read", {"id": cid})
-        cache.put_json("search", "read|{}".format(cid), read_payload, {"kind": "read", "cid": cid})
+    read_payload = _read_payload(cid, client)
 
     pages = _page_urls(read_payload)
     album_aid = str(read_payload.get("id") or cid)
@@ -927,9 +985,9 @@ def _collect_pages(cid: str, lossless: bool, compression: str):
         except Exception:
             continue
         img = thumbs._open(raw)
-        restored = is_scrambled(decode_aid, scramble_id)
+        restored = is_scrambled(album_aid, scramble_id)
         if restored:
-            img = unscramble(img, decode_aid, scramble_id, name)
+            img = unscramble(img, album_aid, scramble_id, name)
         yield item["page"], name, raw, img, restored
 
 
@@ -1191,6 +1249,52 @@ def download(cid: str, title: str = Query("")):
                              headers={"Content-Disposition": archive.content_disposition(filename)})
 
 
+@app.post("/api/zip/jobs")
+async def zip_job_start(request: Request):
+    """Start packing a chapter in the background; /download.html polls the job."""
+    body = await request.json() or {}
+    cid = str(body.get("cid") or "").strip()
+    if not cid:
+        raise HTTPException(status_code=400, detail="cid required")
+    title = str(body.get("title") or "")
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    with _zip_jobs_lock:
+        _prune_zip_jobs(now)
+        job = {"id": job_id, "cid": cid, "title": title, "state": "queued",
+               "done": 0, "total": 0, "progress": 0.0, "bytes": 0, "error": "",
+               "filename": archive.safe_name(title or cid, cid) + ".zip",
+               "created": now, "updated": now}
+        _zip_jobs[job_id] = job
+        snapshot = _zip_job_snapshot(job)
+    threading.Thread(target=_run_zip_job, args=(job_id, cid, title),
+                     daemon=True, name="zip-" + job_id[:8]).start()
+    return _ok(snapshot)
+
+
+@app.get("/api/zip/jobs/{job_id}")
+def zip_job_status(job_id: str):
+    with _zip_jobs_lock:
+        job = _zip_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="no such job")
+        return _ok(_zip_job_snapshot(job))
+
+
+@app.get("/api/zip/jobs/{job_id}/file")
+def zip_job_file(job_id: str):
+    with _zip_jobs_lock:
+        job = _zip_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="no such job")
+        data = job.get("data")
+        filename = job.get("filename") or "comic.zip"
+    if data is None:
+        raise HTTPException(status_code=409, detail="archive not ready")
+    return Response(data, media_type="application/zip",
+                    headers={"Content-Disposition": archive.content_disposition(filename)})
+
+
 @app.delete("/api/cache/item")
 def cache_delete_item(kind: str = Query(...), key: str = Query(...)):
     # Registered before /api/cache/{kind} so a single-item delete is not swallowed by it.
@@ -1330,6 +1434,20 @@ async def task_stream():
                                       "X-Accel-Buffering": "no"})
 
 
+def _mark_cached_pages(task):
+    """Merge disk cache state into the shared task before scheduling downloads."""
+    compression = settings.get("cache_compression") or "minimal"
+    with task._lock:
+        for item in task.pages:
+            if task.states.get(item["index"]) == "done":
+                continue
+            data = _cached_page_bytes(task.cid, int(item["page"]), compression)
+            if data is not None:
+                task.states[item["index"]] = "done"
+                task.bytes += len(data)
+        task.updated = time.time()
+
+
 def _spawn_task(cid: str, title: str = "", aid: str = "", foreground: bool = True):
     """Create (or reuse) the cache task for a chapter and return its snapshot."""
     existing = tasks.get(cid)
@@ -1341,6 +1459,7 @@ def _spawn_task(cid: str, title: str = "", aid: str = "", foreground: bool = Tru
     pages = _page_urls(read_payload)
     album_aid = str(read_payload.get("id") or cid)
     if existing is not None and existing.total > 0:
+        _mark_cached_pages(existing)
         if foreground:
             tasks.set_foreground(cid)
         return existing.to_dict()
@@ -1350,6 +1469,7 @@ def _spawn_task(cid: str, title: str = "", aid: str = "", foreground: bool = Tru
     task = tasks.create(cid, title=title or read_payload.get("name") or cid,
                         aid=album_aid, scramble_id=read_payload.get("scramble_id"),
                         images=pages)
+    _mark_cached_pages(task)
     if foreground:
         tasks.set_foreground(cid)
     return task.to_dict()
