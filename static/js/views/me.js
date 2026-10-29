@@ -107,6 +107,7 @@ function appearance() {
     value: current,
     onChange: (value) => {
       setTheme(value);
+      seg.set(value);
       toast(value === "light" ? "已切换到浅色主题" : "已切换到深色主题");
     },
   });

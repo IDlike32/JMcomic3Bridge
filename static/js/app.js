@@ -14,7 +14,7 @@
 // into messages to the shell, which owns the real history and decides which frame shows.
 import { el, icon, resetCoverStream, resumeCovers, errorState } from "./ui.js";
 import { resetEvents, setSuspended } from "./events.js";
-import { state, bootstrap, refreshLines, setTheme } from "./state.js";
+import { state, bootstrap, refreshLines, setTheme, restoreTheme } from "./state.js";
 import { installTabSwipe } from "./swipe.js";
 
 const view = document.getElementById("view");
@@ -186,6 +186,9 @@ function rekey(entry, key) {
 // Declared above route(): route() reads the pending direction on every navigation.
 let swipeOffset = 0;
 let swipePending = 0;   // -1 back, +1 forward, 0 none: the direction a new frame enters from
+let swipeFrame = 0;
+let swipeSource = null;
+let swipeLatestDx = 0;
 
 function route() {
   const key = normalizeHash(location.hash);
@@ -229,11 +232,24 @@ function paintSwipe(dx) {
   const node = activeFrame.frame;
   const limit = Math.min(120, window.innerWidth * 0.28);
   swipeOffset = Math.max(-limit, Math.min(limit, dx * 0.32));
-  node.classList.toggle("swiping", Math.abs(swipeOffset) > 0.5);
+  if (Math.abs(swipeOffset) > 0.5) node.classList.add("swiping");
   node.style.transform = swipeOffset ? "translate3d(" + swipeOffset + "px,0,0)" : "";
 }
 
+function scheduleSwipePaint(source, dx) {
+  swipeSource = source;
+  swipeLatestDx = dx;
+  if (swipeFrame) return;
+  swipeFrame = requestAnimationFrame(() => {
+    swipeFrame = 0;
+    if (activeFrame && swipeSource === activeFrame.frame.contentWindow) paintSwipe(swipeLatestDx);
+  });
+}
+
 function settleSwipe() {
+  if (swipeFrame) cancelAnimationFrame(swipeFrame);
+  swipeFrame = 0;
+  swipeSource = null;
   if (!activeFrame) return;
   const node = activeFrame.frame;
   node.classList.remove("swiping");
@@ -254,11 +270,10 @@ function applyEnter(entry, dir) {
 }
 
 function handleSwipe(source, data) {
-  const entry = entryFor(source);
-  if (!entry || entry !== activeFrame) return;
+  if (!activeFrame || activeFrame.frame.contentWindow !== source) return;
   if (data.type === "swipe-move") {
     if (data.cancel) settleSwipe();
-    else paintSwipe(Number(data.dx) || 0);
+    else scheduleSwipePaint(source, Number(data.dx) || 0);
     return;
   }
   if (data.type !== "swipe") return;
@@ -271,6 +286,7 @@ function handleSwipe(source, data) {
   settleSwipe();
   location.hash = "#/" + target;
 }
+
 
 function entryFor(source) {
   let found = null;
@@ -307,6 +323,9 @@ function onHostMessage(evt) {
       const next = normalizeHash(data.hash);
       if (next !== normalizeHash(location.hash)) location.hash = next;
       return;
+    }
+    if (data.type === "theme" && (data.theme === "dark" || data.theme === "light")) {
+      detailFrame.contentWindow.postMessage({ type: "theme", theme: state.theme }, location.origin);
     }
     return;
   }
@@ -349,10 +368,14 @@ function onHostMessage(evt) {
     return;
   }
   if (data.type === "theme" && (data.theme === "dark" || data.theme === "light")) {
+    if (entry !== activeFrame) return;
     setTheme(data.theme);
     frames.forEach((other) => {
-      if (other !== entry) post(other, { type: "theme", theme: data.theme });
+      if (other !== entry) post(other, { type: "theme", theme: state.theme });
     });
+    if (detailFrame && detailFrame.contentWindow) {
+      detailFrame.contentWindow.postMessage({ type: "theme", theme: state.theme }, location.origin);
+    }
   }
 }
 
@@ -367,6 +390,11 @@ function openDetail(aid) {
   detailFrame.title = "作品简介";
   detailFrame.src = "/?embed=1&overlay=detail#/album/" + encodeURIComponent(aid);
   detailFrame.setAttribute("allow", "fullscreen");
+  detailFrame.addEventListener("load", () => {
+    if (detailFrame && detailFrame.contentWindow) {
+      detailFrame.contentWindow.postMessage({ type: "theme", theme: state.theme }, location.origin);
+    }
+  });
   detailPanel.append(handle, detailFrame);
   view.append(backdrop, detailPanel);
 
@@ -434,6 +462,7 @@ function bootShell() {
 
   window.addEventListener("hashchange", route);
   window.addEventListener("message", onHostMessage);
+  setTheme(localStorage.getItem("jmbridge.theme") || "dark");
 
   if (!location.hash) history.replaceState(null, "", "#/home");
   route();
@@ -541,6 +570,7 @@ async function renderRoute() {
 }
 
 function bootEmbed() {
+  restoreTheme(false);
   frozenHash = normalizeHash(location.hash);
   if (location.hash !== frozenHash) rawReplaceState.call(history, null, "", frozenHash);
 
@@ -575,7 +605,7 @@ function bootEmbed() {
         requestAnimationFrame(() => window.scrollTo(0, y));
       });
     } else if (data.type === "theme" && (data.theme === "dark" || data.theme === "light")) {
-      setTheme(data.theme);
+      setTheme(data.theme, false);
     }
   });
 
@@ -593,6 +623,8 @@ function bootEmbed() {
   let dragStartX = 0;
   let dragStartY = 0;
   let dragStartScroll = 0;
+  let dragFrame = 0;
+  let dragLatestDx = 0;
   let dragged = false;
   window.addEventListener("pointerdown", (evt) => {
     if (evt.button !== 0) return;
@@ -616,11 +648,22 @@ function bootEmbed() {
       dragRail.classList.add("dragging");
     }
     evt.preventDefault();
-    dragRail.scrollLeft = dragStartScroll - dx;
+    dragLatestDx = dx;
+    if (!dragFrame) {
+      dragFrame = requestAnimationFrame(() => {
+        dragFrame = 0;
+        if (dragRail) dragRail.scrollLeft = dragStartScroll - dragLatestDx;
+      });
+    }
   }, { passive: false });
   window.addEventListener("pointerup", (evt) => {
     if (!dragRail || evt.pointerId !== dragPointerId) return;
-    if (dragged) dragRail.releasePointerCapture?.(dragPointerId);
+    if (dragFrame) cancelAnimationFrame(dragFrame);
+    dragFrame = 0;
+    if (dragged) {
+      dragRail.scrollLeft = dragStartScroll - dragLatestDx;
+      dragRail.releasePointerCapture?.(dragPointerId);
+    }
     dragRail.classList.remove("dragging");
     dragRail = null;
     dragPointerId = 0;

@@ -16,19 +16,20 @@ export const state = {
   progressByCid: new Map(),
 };
 
-export function setTheme(theme) {
+export function setTheme(theme, notifyParent = true) {
   state.theme = theme === "light" ? "light" : "dark";
   document.documentElement.setAttribute("data-theme", state.theme);
   const meta = document.querySelector('meta[name="theme-color"]');
-  if (meta) meta.setAttribute("content", state.theme === "light" ? "#f5f6f9" : "#0d0f13");
+  if (meta) meta.setAttribute("content", state.theme === "light" ? "#edf4f1" : "#0b1012");
   try {
     localStorage.setItem(THEME_KEY, state.theme);
   } catch (err) {
     /* private mode: keep it in memory only */
   }
+  window.dispatchEvent(new CustomEvent("themechange", { detail: state.theme }));
   // Inside a shell frame the sidebar/tabbar belong to another document; tell it.
   try {
-    if (window.parent && window.parent !== window) {
+    if (notifyParent && window.parent && window.parent !== window) {
       window.parent.postMessage({ type: "theme", theme: state.theme }, location.origin);
     }
   } catch (err) {
@@ -41,14 +42,14 @@ export function toggleTheme() {
   return state.theme;
 }
 
-export function restoreTheme() {
+export function restoreTheme(notifyParent = true) {
   let saved = "";
   try {
     saved = localStorage.getItem(THEME_KEY) || "";
   } catch (err) {
     saved = "";
   }
-  setTheme(saved || "dark");
+  setTheme(saved || "dark", notifyParent);
 }
 
 export async function refreshSettings() {

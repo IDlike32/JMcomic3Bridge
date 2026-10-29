@@ -32,6 +32,9 @@ pool = LinePool(max_active=int(settings.get("active_lines") or 3))
 cache = Cache(settings)
 library = Library(settings.data_dir)
 cache.eviction_context = library.cache_eviction_context
+
+# Metadata is disposable: refresh all list, album, and chapter metadata on every startup.
+cache.clear("search")
 hub = Hub()
 app = FastAPI(title="JMBridge", version="1.1.0")
 _zip_jobs = {}

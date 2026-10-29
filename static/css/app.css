@@ -782,9 +782,8 @@ body {
 
 .frame {
   transition: opacity 180ms var(--ease-out), transform var(--dur-spring) var(--ease-spring);
-  will-change: transform, opacity;
 }
-.frame.swiping { transition: none; }
+.frame.swiping { transition: none; will-change: transform; }
 .frame.settling { transition: transform var(--dur-spring) var(--ease-spring); }
 @keyframes frame-enter-fwd {
   from { opacity: .3; transform: translate3d(22%, 0, 0) scale(.985); }

@@ -37,10 +37,18 @@ export function installTabSwipe(options) {
   let start = null;
   let claimed = false;
   let lastFire = 0;
+  let moveFrame = 0;
+  let moveDx = 0;
+
+  function flushMove() {
+    moveFrame = 0;
+    if (claimed) send({ type: "swipe-move", dx: moveDx });
+  }
 
   function reset() {
     start = null;
     claimed = false;
+    moveDx = 0;
   }
 
   function onStart(evt) {
@@ -71,7 +79,14 @@ export function installTabSwipe(options) {
       }
       claimed = true;
     }
-    send({ type: "swipe-move", dx: dx });
+    moveDx = dx;
+    if (!moveFrame) moveFrame = requestAnimationFrame(flushMove);
+  }
+
+  function cancelMove() {
+    if (moveFrame) cancelAnimationFrame(moveFrame);
+    moveFrame = 0;
+    moveDx = 0;
   }
 
   function onEnd(evt) {
@@ -81,6 +96,7 @@ export function installTabSwipe(options) {
     const dy = touch.clientY - start.y;
     const dt = Date.now() - start.t;
     const wasClaimed = claimed;
+    cancelMove();
     reset();
     if (!wasClaimed) return;
     if (dt <= MAX_MS && Math.abs(dx) >= MIN_DX && Math.abs(dx) >= Math.abs(dy) * SLOPE) {
@@ -104,5 +120,6 @@ export function installTabSwipe(options) {
     document.removeEventListener("touchmove", onMove);
     document.removeEventListener("touchend", onEnd);
     document.removeEventListener("touchcancel", reset);
+    cancelMove();
   };
 }
