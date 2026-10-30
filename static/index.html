@@ -12,18 +12,32 @@
 <meta name="color-scheme" content="dark light">
 <title>JMBridge</title>
 <link rel="manifest" href="/manifest.webmanifest">
-<link rel="stylesheet" href="/css/tokens.css">
-<link rel="stylesheet" href="/css/app.css">
-<link rel="stylesheet" href="/css/reader.css">
 <script>
-// A page loaded inside a shell frame must never paint the sidebar/tabbar, not even for
-// one frame of the first render, so the class is set before the body exists.
+// Runs before the stylesheets resolve, so the very first paint already uses the saved theme.
+// Every shell frame is a fresh document; without this a light-theme page painted dark until
+// the module graph reached restoreTheme(). The key and the two colours mirror js/state.js
+// (setTheme) -- keep them in step.
 try {
   if (new URLSearchParams(location.search).has("embed")) {
+    // A page inside a shell frame must never paint the sidebar/tabbar, not even once.
     document.documentElement.classList.add("embed");
   }
 } catch (err) { /* no URLSearchParams: render as a normal page */ }
+try {
+  var savedTheme = "";
+  try { savedTheme = localStorage.getItem("jmbridge.theme") || ""; } catch (err) { savedTheme = ""; }
+  var bootedTheme = savedTheme === "light" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", bootedTheme);
+  // color-scheme drives the browser's own canvas and scrollbars before tokens.css parses;
+  // left to the default it would paint dark behind a light theme for that first frame.
+  document.documentElement.style.colorScheme = bootedTheme;
+  var themeMeta = document.querySelector('meta[name="theme-color"]');
+  if (themeMeta) themeMeta.setAttribute("content", bootedTheme === "light" ? "#edf4f1" : "#0b1012");
+} catch (err) { /* keep the dark default from the html attribute */ }
 </script>
+<link rel="stylesheet" href="/css/tokens.css">
+<link rel="stylesheet" href="/css/app.css">
+<link rel="stylesheet" href="/css/reader.css">
 </head>
 <body>
 <svg id="sprite" aria-hidden="true">
@@ -89,6 +103,6 @@ try {
 
 <div id="toast" class="toast"></div>
 <div id="layer"></div>
-<script type="module" src="/js/app.js"></script>
+<script type="module" src="/js/app.js?v=34"></script>
 </body>
 </html>

@@ -2,6 +2,7 @@
 // single retryable failure beat three sections that each fail on their own.
 import { api, qs } from "../api.js";
 import { state, isFavorite, toggleFavorite } from "../state.js";
+import { canvasGrid } from "../canvas-grid.js";
 import {
   el, icon, toast, tile, sectionHead, skeletonGrid, skeletonRail,
   errorState, infiniteScroll, loadingRow, warmCovers,
@@ -100,6 +101,7 @@ function promoteHref(section) {
 export async function renderHome(view, ctx) {
   let disposed = false;
   let scroll = null;
+  let latestCanvas = null;
 
   const head = el("div", { class: "page-head" }, [
     el("div", { class: "grow" }, [el("h1", { text: "JMBridge" })]),
@@ -115,6 +117,10 @@ export async function renderHome(view, ctx) {
     if (scroll) {
       scroll.disconnect();
       scroll = null;
+    }
+    if (latestCanvas) {
+      latestCanvas.destroy();
+      latestCanvas = null;
     }
     body.innerHTML = "";
     body.append(skeletonRail(6), skeletonGrid(12));
@@ -163,13 +169,21 @@ export async function renderHome(view, ctx) {
     }
 
     body.appendChild(sectionHead("最新上架", {}));
-    const grid = el("div", { class: "grid" });
+    latestCanvas = canvasGrid({ label: "最新上架", onOpen: (item) => {
+      const aid = String(item.id || item.aid || "");
+      if (window.parent !== window) window.parent.postMessage({ type: "detail", aid }, location.origin);
+      else location.hash = "#/album/" + encodeURIComponent(aid);
+    } });
+    const grid = latestCanvas;
     const sentinel = loadingRow("加载中…");
-    body.append(grid, sentinel);
+    body.append(grid.node, sentinel);
 
     if (latestRes.status === "rejected") {
       sentinel.remove();
-      grid.appendChild(errorState(errText(latestRes.reason), mount));
+      latestCanvas.destroy();
+      latestCanvas = null;
+      grid.node.remove();
+      body.appendChild(errorState(errText(latestRes.reason), mount));
       return;
     }
 
@@ -184,7 +198,7 @@ export async function renderHome(view, ctx) {
         const id = String(item.id || "");
         if (!id || seen.has(id)) return;
         seen.add(id);
-        grid.appendChild(favTile(item));
+        grid.append([item]);
         added += 1;
       });
       loaded += added;
@@ -223,5 +237,6 @@ export async function renderHome(view, ctx) {
   return () => {
     disposed = true;
     if (scroll) scroll.disconnect();
+    if (latestCanvas) latestCanvas.destroy();
   };
 }

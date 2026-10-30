@@ -19,6 +19,9 @@ export const state = {
 export function setTheme(theme, notifyParent = true) {
   state.theme = theme === "light" ? "light" : "dark";
   document.documentElement.setAttribute("data-theme", state.theme);
+  // index.html boots this inline so the first paint is already correct; switching later has to
+  // move it too, or the inline value would keep winning over the stylesheet rule.
+  document.documentElement.style.colorScheme = state.theme;
   const meta = document.querySelector('meta[name="theme-color"]');
   if (meta) meta.setAttribute("content", state.theme === "light" ? "#edf4f1" : "#0b1012");
   try {

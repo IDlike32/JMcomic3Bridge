@@ -21,8 +21,13 @@ function chapterLabel(chapter, index) {
   return "第 " + sort + " 话";
 }
 
-export async function openReader(cid, aid) {
+export async function openReader(cid, aid, isActive) {
+  const valid = typeof isActive === "function" ? isActive : () => true;
   const id = String(cid || "");
+  function goBack() {
+    if (history.length > 1) history.back();
+    else location.hash = aid ? "#/album/" + encodeURIComponent(aid) : "#/home";
+  }
   if (!id) {
     location.hash = "#/home";
     return { close() {} };
@@ -32,7 +37,7 @@ export async function openReader(cid, aid) {
   const openingRoot = el("div", { class: "reader reader-opening-shell" });
   openingRoot.appendChild(el("div", { class: "r-bar top" }, [
     el("div", { class: "r-head" }, [
-      el("button", { type: "button", "aria-label": "返回", onClick: () => history.back() }, [icon("arrow-left")]),
+      el("button", { type: "button", "aria-label": "返回", onClick: goBack }, [icon("arrow-left")]),
       el("div", { class: "title", text: "正在读取章节目录…" }),
     ]),
   ]));
@@ -40,6 +45,7 @@ export async function openReader(cid, aid) {
     loadingAnimation("cover", "正在连接漫画线路"),
     el("div", { class: "muted tiny", text: "目录响应后会立即开始载入页面" }),
   ]));
+  if (!valid()) return { close() {} };
   document.body.appendChild(openingRoot);
 
   let read = null;
@@ -50,6 +56,10 @@ export async function openReader(cid, aid) {
     failure = String(err && err.message ? err.message : err);
   }
 
+  if (!valid()) {
+    openingRoot.remove();
+    return { close() {} };
+  }
   openingRoot.remove();
   const root = el("div", { class: "reader" });
   const loadBar = el("div", { class: "r-loadbar" }, [el("i", { style: "width:0%" })]);
@@ -64,7 +74,7 @@ export async function openReader(cid, aid) {
     const unsupported = isUnsupported(failure);
     root.appendChild(el("div", { class: "r-bar top" }, [
       el("div", { class: "r-head" }, [
-        el("button", { type: "button", "aria-label": "返回", onClick: () => history.back() }, [icon("arrow-left")]),
+        el("button", { type: "button", "aria-label": "返回", onClick: goBack }, [icon("arrow-left")]),
         el("div", { class: "title", text: unsupported ? "暂不支持" : "打开失败" }),
       ]),
     ]));
@@ -110,7 +120,7 @@ export async function openReader(cid, aid) {
     el("span", { class: "r-title-name", text: title }),
     el("span", { class: "r-title-cid", text: "cid " + id }),
   ]);
-  const backBtn = el("button", { type: "button", "aria-label": "返回", onClick: () => history.back() }, [icon("arrow-left")]);
+  const backBtn = el("button", { type: "button", "aria-label": "返回", onClick: goBack }, [icon("arrow-left")]);
   const settingsBtn = el("button", { type: "button", "aria-label": "阅读设置", onClick: () => openSettings() }, [icon("settings")]);
   const downloadBtn = el("button", {
     type: "button",
@@ -697,7 +707,7 @@ export async function openReader(cid, aid) {
     if (evt.target && evt.target.closest("[role=dialog], .sheet, .modal")) return;
     if (evt.key === "Escape") {
       if (drawerOpen) toggleDrawer(false);
-      else history.back();
+      else goBack();
     } else if (evt.key === "ArrowDown" || evt.key === "PageDown" || evt.key === " ") {
       evt.preventDefault();
       flow.scrollBy(evt.key === " " ? metricsHeight() * 0.9 : metricsHeight() * 0.35);
@@ -790,6 +800,25 @@ export async function openReader(cid, aid) {
   }, { passive: true });
   scroller.addEventListener("touchcancel", () => { swipeStart = null; }, { passive: true });
 
+  let scrollFrame = 0;
+  // The reader runs inside the shell's frame and reports its own scroll offset, which is
+  // the scroller's rather than the document's. This has to be done here: the shell's
+  // postHost is module-private and is not visible from this file.
+  function reportScroll() {
+    if (scrollFrame) return;
+    scrollFrame = requestAnimationFrame(() => {
+      scrollFrame = 0;
+      if (destroyed) return;
+      try {
+        if (window.parent && window.parent !== window) {
+          window.parent.postMessage({ type: "scroll", y: scroller.scrollTop }, location.origin);
+        }
+      } catch (err) {
+        /* detached frame */
+      }
+    });
+  }
+  scroller.addEventListener("scroll", reportScroll, { passive: true });
   scroller.addEventListener("click", onScrollerClick);
   document.addEventListener("keydown", keyHandler);
   document.addEventListener("visibilitychange", onVisibility);
@@ -972,13 +1001,17 @@ export async function openReader(cid, aid) {
   }
 
   async function restorePosition() {
+    if (destroyed) return;
     try {
       const record = await api.progressGet(id);
-      if (!record || !record.page || record.page < 2) return;
+      if (destroyed) return;
+      if (!record || !record.page) return;
       if (record.page >= total) return;
+      // flow keeps this page pinned until real sizes land; the pixel position alone drifts.
       flow.scrollToPage(record.page);
       updateCounter(record.page);
       slider.value = String(record.page);
+      if (record.page < 2) return;
       scheduleHide();
       toast("已回到第 " + record.page + " 页");
     } catch (err) {
@@ -990,6 +1023,7 @@ export async function openReader(cid, aid) {
   function close() {
     if (destroyed) return;
     destroyed = true;
+    if (scrollFrame) cancelAnimationFrame(scrollFrame);
     reporter.flush(flow.currentPage());
     reporter.destroy();
     stopStatusPoll();
@@ -997,6 +1031,8 @@ export async function openReader(cid, aid) {
     document.removeEventListener("keydown", keyHandler);
     document.removeEventListener("visibilitychange", onVisibility);
     window.removeEventListener("pagehide", onPageHide);
+    scroller.removeEventListener("scroll", reportScroll);
+    if (scrollFrame) cancelAnimationFrame(scrollFrame);
     scroller.removeEventListener("click", onScrollerClick);
     flow.destroy();
     api.pauseTask(id).catch(() => {});
@@ -1020,7 +1056,23 @@ export async function openReader(cid, aid) {
   startTask();
   restorePosition();
 
-  return { close, root };
+  function currentScroll() {
+    return scroller.scrollTop;
+  }
+
+  function restoreScroll(y) {
+    if (destroyed) return;
+    const target = Math.max(0, Number(y) || 0);
+    requestAnimationFrame(() => {
+      if (destroyed) return;
+      scroller.scrollTop = target;
+      requestAnimationFrame(() => {
+        if (!destroyed) scroller.scrollTop = target;
+      });
+    });
+  }
+
+  return { close, root, currentScroll, restoreScroll };
 }
 
 export default openReader;

@@ -45,6 +45,12 @@ export function createFlow(options) {
   let heights = [];
   let tops = [];
   let nodes = [];
+  let pageStates = [];
+  let windowCenter = 0;
+  // Page the reader must stay on while page sizes arrive asynchronously; -1 means free.
+  let pinIndex = -1;
+  let windowFrom = 0;
+  let windowTo = 0;
   let destroyed = false;
   let rafPending = 0;
   let lastFirstVisible = -1;
@@ -62,9 +68,27 @@ export function createFlow(options) {
     return Math.round(metrics().width * (prefs.zoom || 1));
   }
 
+  // Reading this is O(n) plus a sort, and relayout asks for it once per page. Sizes
+  // arrive one page at a time, so an uncached median turns a single relayout into
+  // O(n^2 log n) and a caching chapter into hundreds of those.
+  let medianRatio = 0;
+  function reuseMedian() { medianRatio = 0; }
+
+  function estimatedRatio() {
+    if (medianRatio) return medianRatio;
+    // Unknown pages inherit the observed median ratio, so the placeholder stack is
+    // close to the real document height and the scrollbar can actually reach a page.
+    const seen = [];
+    for (let i = 0; i < total; i += 1) {
+      if (known[i] && ratios[i]) seen.push(ratios[i]);
+    }
+    medianRatio = seen.length ? (seen.sort((a, b) => a - b), seen[seen.length >> 1]) : DEFAULT_RATIO;
+    return medianRatio;
+  }
+
   function heightFor(index) {
     const { width, height } = metrics();
-    const ratio = ratios[index] || DEFAULT_RATIO;
+    const ratio = ratios[index] || estimatedRatio();
     const fit = prefs.fit || "width";
     if (fit === "height") return Math.round(height);
     if (fit === "original") {
@@ -114,7 +138,9 @@ export function createFlow(options) {
       entry.node.style.top = tops[i] + "px";
       entry.node.style.height = heights[i] + "px";
     }
-    if (anchor !== undefined && anchor !== null) {
+    if (pinIndex >= 0 && pinIndex < total) {
+      scrollEl.scrollTop = Math.max(0, tops[pinIndex] || 0);
+    } else if (anchor !== undefined && anchor !== null) {
       scrollEl.scrollTop = Math.max(0, tops[anchor] || 0);
     }
   }
@@ -169,12 +195,67 @@ export function createFlow(options) {
       if (entry.loaded || entry.broken || !entry.cached) continue;
       inflight += 1;
       entry.requested = true;
+      entry.requestActive = true;
       // Keep the tile's cache status visible until the local image responds.
       // The request itself is tracked separately to avoid making every tile look cached.
       // Clear first: assigning the same URL to a failed <img> does not reload it, and a
       // page that came back 503 must actually be asked for again.
       entry.img.removeAttribute("src");
       entry.img.src = opts.pageUrlFor(index);
+    }
+  }
+
+  function mountWindow(center) {
+    if (destroyed || !total) return;
+    windowCenter = Math.max(0, Math.min(total - 1, Number(center) || 0));
+    const WINDOW_SIZE = Math.min(100, total);
+    const oldFrom = windowFrom;
+    const oldTo = windowTo;
+    let from;
+    if (windowTo > windowFrom && windowCenter >= windowFrom && windowCenter < windowTo) {
+      from = windowFrom;
+      if (windowCenter >= windowTo - 2 && windowTo < total) {
+        from = Math.min(total - WINDOW_SIZE, windowFrom + Math.max(1, windowCenter - (windowTo - 3)));
+      } else if (windowCenter <= windowFrom + 2 && windowFrom > 0) {
+        from = Math.max(0, windowFrom - Math.max(1, windowFrom + 2 - windowCenter));
+      }
+    } else {
+      from = Math.max(0, Math.min(total - WINDOW_SIZE, windowCenter - Math.floor(WINDOW_SIZE / 2)));
+    }
+    const to = Math.min(total, from + WINDOW_SIZE);
+    windowFrom = from;
+    windowTo = to;
+    for (let i = from; i < to; i += 1) {
+      if (nodes[i]) continue;
+      const entry = buildNode(i);
+      const state = pageStates[i];
+      if (state) {
+        entry.state = state.state || "idle";
+        entry.cached = !!state.cached;
+        entry.error = state.error || "";
+        entry.attempts = Number(state.attempts || 0);
+        entry.maxAttempts = Number(state.maxAttempts || 0);
+        // A cached page is loadable again; inheriting a stale failure would make
+        // every remount of that page skip its request forever.
+        entry.broken = !state.cached && !!state.broken;
+        entry.loaded = false;
+        entry.requested = false;
+        paintState(entry);
+      }
+      flowEl.appendChild(entry.node);
+      nodes[i] = entry;
+      entry.node.style.top = (tops[i] || 0) + "px";
+      entry.node.style.height = (heights[i] || heightFor(i)) + "px";
+      if (entry.cached) enqueue(i);
+    }
+    for (let i = oldFrom; i < oldTo; i += 1) {
+      if (i >= from && i < to) continue;
+      const entry = nodes[i];
+      if (!entry) continue;
+      entry.mounted = false;
+      entry.img.removeAttribute("src");
+      entry.node.remove();
+      nodes[i] = null;
     }
   }
 
@@ -216,11 +297,17 @@ export function createFlow(options) {
       loadErrors: 0,
       retryTimer: 0,
       visual: "st-idle",
+      mounted: true,
+      requestActive: false,
     };
 
     img.addEventListener("load", () => {
+      if (!entry.requestActive) return;
+      entry.requestActive = false;
+      if (!entry.mounted || destroyed) { releaseSlot(); return; }
       entry.loaded = true;
       entry.requested = false;
+      pageStates[index] = Object.assign(pageStates[index] || {}, { loaded: true, cached: entry.cached });
       entry.loadErrors = 0;
       wrap.classList.add("loaded");
       box.style.opacity = "0";
@@ -231,6 +318,9 @@ export function createFlow(options) {
     });
 
     img.addEventListener("error", () => {
+      if (!entry.requestActive) return;
+      entry.requestActive = false;
+      if (!entry.mounted || destroyed) { releaseSlot(); return; }
       entry.loadErrors += 1;
       // A 503 means the page is not in the cache *yet*: fetching belongs to the cache
       // task, so retrying immediately would only repeat the same miss. Drop back to
@@ -238,6 +328,7 @@ export function createFlow(options) {
       // stores the page, and that is what queues the load again.
       entry.broken = true;
       entry.requested = false;
+      pageStates[index] = Object.assign(pageStates[index] || {}, { broken: true, cached: entry.cached, error: entry.error || "" });
       // Cache state is authoritative; do not retry an HTTP miss while the worker waits for CDN.
       wrap.classList.toggle("errored", entry.broken);
       paintState(entry);
@@ -260,14 +351,17 @@ export function createFlow(options) {
   // ---- scroll reporting ------------------------------------------------------
 
   function enqueueWindow(center) {
-    const from = Math.max(0, Number(center) || 0);
-    const to = Math.min(total, from + 8);
+    // Both directions: scrolling up must warm the block above the viewport too.
+    const mid = Math.max(0, Math.min(total - 1, Number(center) || 0));
+    const from = Math.max(0, mid - 8);
+    const to = Math.min(total, mid + 9);
     for (let index = from; index < to; index += 1) enqueue(index);
   }
 
   function reportVisible() {
     if (!total) return;
     const first = indexAt(scrollEl.scrollTop);
+    mountWindow(first);
     enqueueWindow(first);
     if (first === lastFirstVisible) return;
     lastFirstVisible = first;
@@ -283,6 +377,12 @@ export function createFlow(options) {
   }
 
   scrollEl.addEventListener("scroll", scheduleReport, { passive: true });
+  // Real input ends the restore hold; programmatic alignment above must not trip it.
+  const releasePin = () => { pinIndex = -1; };
+  scrollEl.addEventListener("wheel", releasePin, { passive: true });
+  scrollEl.addEventListener("touchstart", releasePin, { passive: true });
+  scrollEl.addEventListener("pointerdown", releasePin, { passive: true });
+  scrollEl.addEventListener("keydown", releasePin);
 
   function resize() {
     if (destroyed) return;
@@ -308,6 +408,7 @@ export function createFlow(options) {
       total = Math.max(0, Number(count) || 0);
       ratios = new Array(total);
       known = new Array(total);
+      reuseMedian();
       heights = new Array(total);
       tops = new Array(total);
       queue = [];
@@ -318,12 +419,9 @@ export function createFlow(options) {
         entry.node.remove();
       });
       nodes = new Array(total);
-      for (let i = 0; i < total; i += 1) {
-        const entry = buildNode(i);
-        flowEl.appendChild(entry.node);
-        nodes[i] = entry;
-      }
+      pageStates = new Array(total);
       relayout();
+      mountWindow(windowCenter);
     },
     loadVisible() {
       if (!destroyed && total) reportVisible();
@@ -339,6 +437,7 @@ export function createFlow(options) {
         ratios[index] = ratio;
         known[index] = true;
         changed = true;
+        reuseMedian();
       });
       if (!changed) return;
       const anchor = indexAt(scrollEl.scrollTop);
@@ -351,24 +450,46 @@ export function createFlow(options) {
       let changed = false;
       (pages || []).forEach((page) => {
         const index = Number(page.index);
+        const nextState = {
+          state: page.state || "idle", cached: !!page.cached, error: page.error || "",
+          attempts: Number(page.attempts || 0), maxAttempts: Number(page.max_attempts || 0)
+        };
+        const previous = pageStates[index] || {};
+        const stateChanged = previous.state !== nextState.state ||
+          previous.cached !== nextState.cached || previous.error !== nextState.error ||
+          previous.attempts !== nextState.attempts || previous.maxAttempts !== nextState.maxAttempts;
+        pageStates[index] = Object.assign(previous, nextState);
+        // Cache progress invalidates an old local miss, including for unmounted pages.
+        if (nextState.cached) delete pageStates[index].broken;
         const entry = nodes[index];
         if (!entry) return;
-        entry.state = page.state || "idle";
-        entry.cached = !!page.cached;
+        if (!stateChanged) {
+          if (entry.broken && nextState.cached) {
+            entry.broken = false;
+            entry.loadErrors = 0;
+            entry.node.classList.remove("errored");
+            paintState(entry);
+            enqueue(index);
+          }
+          return;
+        }
+        entry.state = nextState.state;
+        entry.cached = nextState.cached;
         if (entry.cached) {
           entry.broken = false;
           entry.loadErrors = 0;
           entry.node.classList.remove("errored");
         }
-        entry.error = page.error || "";
-        entry.attempts = Number(page.attempts || 0);
-        entry.maxAttempts = Number(page.max_attempts || 0);
+        entry.error = nextState.error;
+        entry.attempts = nextState.attempts;
+        entry.maxAttempts = nextState.maxAttempts;
         if (page.w && page.h) {
           const ratio = page.w / page.h;
           if (Math.abs((ratios[index] || DEFAULT_RATIO) - ratio) > 0.002) {
             ratios[index] = ratio;
             known[index] = true;
             changed = true;
+            reuseMedian();
           }
         }
         paintState(entry);
@@ -391,6 +512,12 @@ export function createFlow(options) {
     },
     scrollToPage(pageNo, smooth) {
       const index = Math.max(0, Math.min(total - 1, Number(pageNo) - 1));
+      // Sizes stream in after this call, so every later relayout must re-align here.
+      pinIndex = index;
+      // Mount and request the target block now; waiting for the scroll event leaves
+      // the reader on an empty placeholder for a frame or two.
+      mountWindow(index);
+      enqueueWindow(index);
       const top = tops[index] || 0;
       if (smooth) scrollEl.scrollTo({ top: top, behavior: "smooth" });
       else scrollEl.scrollTop = top;
@@ -403,9 +530,11 @@ export function createFlow(options) {
       return heights[index] || 0;
     },
     scrollBy(delta) {
+      pinIndex = -1;
       scrollEl.scrollBy({ top: delta, behavior: "smooth" });
     },
     scrollToEnd() {
+      pinIndex = -1;
       scrollEl.scrollTo({ top: scrollEl.scrollHeight, behavior: "smooth" });
     },
     failedIndexes() {

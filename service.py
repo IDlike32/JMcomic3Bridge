@@ -36,7 +36,7 @@ cache.eviction_context = library.cache_eviction_context
 # Metadata is disposable: refresh all list, album, and chapter metadata on every startup.
 cache.clear("search")
 hub = Hub()
-app = FastAPI(title="JMBridge", version="1.1.0")
+app = FastAPI(title="JMBridge", version="1.1.1")
 _zip_jobs = {}
 _zip_jobs_lock = threading.Lock()
 
@@ -232,7 +232,7 @@ async def _startup():
 
 @app.get("/api/health")
 def health():
-    return _ok({"version": "1.1.0", "lines": pool.snapshot(), "cache": cache.stats()})
+    return _ok({"version": "1.1.1", "lines": pool.snapshot(), "cache": cache.stats()})
 
 
 @app.get("/api/lines")

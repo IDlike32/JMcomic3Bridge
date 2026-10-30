@@ -136,15 +136,22 @@ class Task:
     def next_page(self):
         """Claim the highest-priority unclaimed page.
 
-        Priority is strictly sequential from the focus point: pages before the
-        user's position are abandoned, not fetched.
+        Priority spreads outwards from the focus point, alternating backwards and
+        forwards, so scrolling up warms the same way scrolling down does.
         """
         with self._lock:
             n = self.total
             if not n:
                 return None
             start = min(max(0, self.focus), n - 1)
-            order = list(range(start, n)) + list(range(0, start))
+            order = [start]
+            step = 1
+            while start - step >= 0 or start + step < n:
+                if start + step < n:
+                    order.append(start + step)
+                if start - step >= 0:
+                    order.append(start - step)
+                step += 1
             for i in order:
                 if self.states.get(i) in (None, "idle", "error"):
                     self.states[i] = "claimed"

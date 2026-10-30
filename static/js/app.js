@@ -27,7 +27,7 @@ const READ_HEAD = "read";
 
 const ROUTES = {
   home: () => import("./views/home.js").then((module) => module.renderHome),
-  browse: () => import("./views/browse.js").then((module) => module.renderBrowse),
+  browse: () => import("./views/browse.js?v=37").then((module) => module.renderBrowse),
   search: () => import("./views/search.js").then((module) => module.renderSearch),
   library: () => import("./views/library.js").then((module) => module.renderLibrary),
   me: () => import("./views/me.js").then((module) => module.renderMe),
@@ -166,8 +166,17 @@ function activate(entry) {
   else showLoading();
 }
 
+function saveScrollPosition(entry) {
+  if (!entry) return;
+  try {
+    const y = entry.frame.contentWindow && entry.frame.contentWindow.scrollY;
+    if (Number.isFinite(y)) scrollPositions.set(entry.key, Math.max(0, y));
+  } catch (_) {}
+}
+
 function drop(entry) {
   if (!entry) return;
+  saveScrollPosition(entry);
   post(entry, { type: "active", on: false });
   frames.delete(entry.key);
   if (entry === activeFrame) activeFrame = null;
@@ -176,7 +185,9 @@ function drop(entry) {
 
 function rekey(entry, key) {
   if (entry.key === key) return;
-  frames.delete(entry.key);
+  const previousKey = entry.key;
+  frames.delete(previousKey);
+  if (scrollPositions.has(previousKey)) scrollPositions.set(key, scrollPositions.get(previousKey));
   const occupant = frames.get(key);
   if (occupant && occupant !== entry) drop(occupant);
   entry.key = key;
@@ -202,6 +213,7 @@ function route() {
   }
 
   const leaving = activeFrame;
+  saveScrollPosition(leaving);
   let entry = frames.get(key);
   if (!entry) entry = makeFrame(key);
   activate(entry);
@@ -358,6 +370,7 @@ function onHostMessage(evt) {
     // Address-bar bookkeeping from inside a page (search query, library tab). The page
     // stays mounted; only the shell's hash follows it.
     const next = normalizeHash(data.hash);
+    try { scrollPositions.set(next, Math.max(0, entry.frame.contentWindow.scrollY || 0)); } catch (_) {}
     rekey(entry, next);
     history.replaceState(null, "", next);
     paintChrome(next);
@@ -482,6 +495,7 @@ let activeReader = null;
 let renderToken = 0;
 let frozenHash = "#/home";
 let rawReplaceState = null;
+let renderChain = Promise.resolve();
 
 function postHost(message) {
   try {
@@ -516,7 +530,7 @@ async function teardown() {
   view.innerHTML = "";
 }
 
-async function renderRoute() {
+async function renderRouteNow() {
   const token = ++renderToken;
   const { head, rest, query } = parseHash(frozenHash);
 
@@ -532,10 +546,15 @@ async function renderRoute() {
       ]),
     ]));
     try {
-      const { openReader } = await import("./views/reader/index.js");
+      const { openReader } = await import("./views/reader/index.js?v=12");
       if (token !== renderToken) return;
       view.innerHTML = "";
-      activeReader = await openReader(rest[0], query.get("aid"));
+      const reader = await openReader(rest[0], query.get("aid"), () => token === renderToken);
+      if (token !== renderToken) {
+        try { reader && reader.close && reader.close(); } catch (err) { /* stale route */ }
+        return;
+      }
+      activeReader = reader;
     } catch (err) {
       if (token !== renderToken) return;
       view.innerHTML = "";
@@ -569,6 +588,12 @@ async function renderRoute() {
   }
 }
 
+function renderRoute() {
+  const run = renderChain.then(renderRouteNow, renderRouteNow);
+  renderChain = run.catch(() => {});
+  return run;
+}
+
 function bootEmbed() {
   restoreTheme(false);
   frozenHash = normalizeHash(location.hash);
@@ -587,6 +612,35 @@ function bootEmbed() {
     }
   });
 
+  let pendingRestoreY = null;
+  let restoreObserver = null;
+  let restoreTimer = 0;
+  // Views check this while drawing: covers stay unloaded until the page has settled at
+  // the restored offset, so the position is reached without a burst of image requests
+  // for rows the user is scrolling straight past.
+  function setRestoring(on) {
+    if (on) window.__jmRestoring = true;
+    else window.__jmRestoring = false;
+    window.dispatchEvent(new CustomEvent("jm:restore-state", { detail: { restoring: on } }));
+  }
+  function finishRestore() {
+    pendingRestoreY = null;
+    if (restoreObserver) restoreObserver.disconnect();
+    restoreObserver = null;
+    clearTimeout(restoreTimer);
+    setRestoring(false);
+  }
+  function applyPendingRestore() {
+    if (pendingRestoreY === null) return;
+    const maxY = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+    const y = Math.min(pendingRestoreY, maxY);
+    window.scrollTo(0, y);
+    if (maxY < pendingRestoreY) return;
+    requestAnimationFrame(() => {
+      if (Math.abs(window.scrollY - pendingRestoreY) < 2) finishRestore();
+    });
+  }
+
   window.addEventListener("message", (evt) => {
     if (evt.origin !== location.origin) return;
     const data = evt.data;
@@ -599,11 +653,14 @@ function bootEmbed() {
       setSuspended(!data.on);
       if (data.on) resumeCovers();
     } else if (data.type === "restore-scroll" && Number.isFinite(data.y)) {
-      const y = Math.max(0, data.y);
-      requestAnimationFrame(() => {
-        window.scrollTo(0, y);
-        requestAnimationFrame(() => window.scrollTo(0, y));
-      });
+      pendingRestoreY = Math.max(0, data.y);
+      setRestoring(true);
+      if (restoreObserver) restoreObserver.disconnect();
+      restoreObserver = new MutationObserver(applyPendingRestore);
+      restoreObserver.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+      clearTimeout(restoreTimer);
+      restoreTimer = setTimeout(finishRestore, 15000);
+      requestAnimationFrame(() => requestAnimationFrame(applyPendingRestore));
     } else if (data.type === "theme" && (data.theme === "dark" || data.theme === "light")) {
       setTheme(data.theme, false);
     }
@@ -614,7 +671,9 @@ function bootEmbed() {
     if (scrollFrame) return;
     scrollFrame = requestAnimationFrame(() => {
       scrollFrame = 0;
-      postHost({ type: "scroll", y: window.scrollY });
+      if (pendingRestoreY !== null) return;
+      postHost({ type: "scroll", y: activeReader && typeof activeReader.currentScroll === "function"
+        ? activeReader.currentScroll() : window.scrollY });
     });
   }, { passive: true });
 

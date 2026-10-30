@@ -3,7 +3,7 @@ import { api, fmtBytes } from "../api.js";
 import { el, icon, toast, segControl, listRow, statCard, loadingRow } from "../ui.js";
 import { state, setTheme, saveSettings, refreshLines } from "../state.js";
 
-const VERSION_FALLBACK = "1.0.0";
+const VERSION_FALLBACK = "1.1.1";
 
 export async function renderMe(view) {
   view.appendChild(loadingRow("加载中…", "detail"));

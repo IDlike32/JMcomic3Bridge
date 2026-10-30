@@ -1,7 +1,8 @@
 // Search: debounced query, paged results, SSE expansion, and local advanced filters.
 import { api } from "../api.js";
+import { canvasGrid } from "../canvas-grid.js";
 import {
-  el, icon, iconButton, toast, section, segControl, tile, tileGrid,
+  el, icon, iconButton, toast, section, segControl,
   skeletonGrid, loadingRow, emptyState, errorState, listRow, infiniteScroll,
 } from "../ui.js";
 
@@ -67,8 +68,8 @@ export async function renderSearch(view, ctx) {
     renderOffset: 0,
     renderItems: [],
     renderedIds: new Set(),
-    pageSize: 36,
-    maxDomItems: 72,
+    emptyPages: 0,
+    pageSize: 0,
   };
 
   const input = el("input", {
@@ -106,20 +107,29 @@ export async function renderSearch(view, ctx) {
   const advancedBtn = el("button", { class: "btn ghost sm", type: "button", text: "高级筛选" });
   typeSelect.addEventListener("change", () => { box.searchType = typeSelect.value; syncUrl(box.word, box.order); if (box.word) runSearch(box.word); });
   const filterHost = el("div", { class: "advanced-search hidden" });
-  const toolbar = el("div", { class: "row wrap", style: "gap:10px;margin-bottom:10px" }, [
+  const toolbar = el("div", { class: "row wrap search-toolbar", style: "gap:10px;margin-bottom:10px" }, [
     seg,
     countNode,
     advancedBtn,
   ]);
+  head.appendChild(toolbar);
 
   const stateHost = el("div");
   // One grid node for the whole session: re-creating it per page would reload every cover.
-  const grid = tileGrid([], {});
+  const grid = canvasGrid({
+    label: "搜索结果",
+    onOpen: (item) => {
+      const aid = String(item.id || item.aid || "");
+      if (window.parent !== window) window.parent.postMessage({ type: "detail", aid }, location.origin);
+      else location.hash = "#/album/" + encodeURIComponent(aid);
+    },
+  });
   const sentinel = el("div", { style: "height:1px" });
   const foot = el("div", { class: "row", style: "justify-content:center;padding:12px 0" });
-  const results = el("div", { class: "hidden" }, [toolbar, filterHost, stateHost, grid, sentinel, foot]);
+  const results = el("div", { class: "hidden" }, [filterHost, stateHost, grid.node, sentinel, foot]);
 
   const hero = el("div");
+  view.classList.add("search-view");
   view.appendChild(head);
   view.appendChild(hero);
   view.appendChild(results);
@@ -164,6 +174,11 @@ export async function renderSearch(view, ctx) {
 
   function addCondition() {
     const q = input.value.trim();
+    if (/^\d+$/.test(q)) {
+      closeStream();
+      location.hash = "#/album/" + q;
+      return;
+    }
     if (!q) { if (box.conditions.length) runSearch(box.word); return; }
     if (box.conditions.length >= 8) { toast("最多添加 8 个搜索条件"); return; }
     box.conditions.push({ q, type: box.searchType });
@@ -237,47 +252,25 @@ export async function renderSearch(view, ctx) {
 
   function filteredItems() { return box.items.filter(matches); }
 
+  // One commit per update: the canvas only paints the rows in view, so appending is
+  // never cheaper in batches, and an empty intermediate list would reset the scroll.
   function renderFiltered() {
     box.renderToken += 1;
     if (box.renderFrame) cancelAnimationFrame(box.renderFrame);
+    box.renderFrame = 0;
     box.renderItems = filteredItems();
-    box.renderOffset = 0;
+    box.renderOffset = box.renderItems.length;
     box.renderedIds.clear();
-    grid.replaceChildren();
+    grid.setItems(box.renderItems);
     updateCount();
     if (box.items.length && !box.renderItems.length) {
       stateHost.replaceChildren(emptyState({ icon: "search", title: "没有符合条件的结果", text: "调整高级搜索条件后重试" }));
       return;
     }
     if (stateHost.querySelector(".empty")) stateHost.replaceChildren();
-    renderNextBatch();
-  }
-
-  function renderNextBatch() {
-    if (box.renderFrame || box.renderOffset >= box.renderItems.length) return;
-    const token = box.renderToken;
-    box.renderFrame = requestAnimationFrame(() => {
-      box.renderFrame = 0;
-      if (token !== box.renderToken) return;
-      const end = Math.min(box.renderOffset + box.pageSize, box.renderItems.length);
-      const fragment = document.createDocumentFragment();
-      for (; box.renderOffset < end; box.renderOffset += 1) {
-        const item = box.renderItems[box.renderOffset];
-        fragment.appendChild(tile(item));
-      }
-      grid.appendChild(fragment);
-      while (grid.children.length > box.maxDomItems) {
-        const old = grid.firstElementChild;
-        if (!old) break;
-        old.querySelectorAll(".cover-canvas-wrap").forEach((node) => { if (typeof node.__cancel === "function") node.__cancel(); });
-        old.remove();
-      }
-      box.renderFrame = 0;
-    });
   }
 
   function appendItems(items) {
-    const preserveY = window.scrollY;
     let added = 0;
     (items || []).forEach((item) => {
       const id = String(item && item.id !== undefined && item.id !== null ? item.id : "");
@@ -286,14 +279,10 @@ export async function renderSearch(view, ctx) {
       box.items.push(item);
       added += 1;
     });
+    // The list only ever grows here, so the browser keeps the scroll offset by itself.
+    // Re-applying an old offset would fight a scroll the user started while it loaded.
     renderFiltered();
     refreshSuggestions();
-    if (preserveY > 0) {
-      requestAnimationFrame(() => {
-        window.scrollTo(0, preserveY);
-        requestAnimationFrame(() => window.scrollTo(0, preserveY));
-      });
-    }
     return added;
   }
 
@@ -351,7 +340,8 @@ export async function renderSearch(view, ctx) {
     box.items = [];
     box.loading = false;
     box.ended = false;
-    grid.replaceChildren();
+    box.emptyPages = 0;
+    grid.setItems([]);
     foot.replaceChildren();
     syncUrl(word, box.order);
 
@@ -372,8 +362,9 @@ export async function renderSearch(view, ctx) {
       const payload = await api.search(word, 1, box.order, box.searchType);
       if (gen !== box.gen) return;
       stateHost.replaceChildren();
-      box.page = Number(payload.page) || 1;
+      box.page = Math.max(1, Number(payload.page) || 1);
       box.total = Number(payload.total) || 0;
+      if (payload.items && payload.items.length) box.pageSize = payload.items.length;
       const added = appendItems(payload.items);
       updateCount();
       rememberQuery(word);
@@ -402,22 +393,35 @@ export async function renderSearch(view, ctx) {
     if (!box.word || box.ended || box.streaming) return false;
     // Staying "busy" must not report the list as finished, or the observer retires for good.
     if (box.loading) return true;
-    if (box.renderOffset < box.renderItems.length) { renderNextBatch(); pump(); return true; }
     const gen = box.gen;
     box.loading = true;
     foot.replaceChildren(loadingRow("加载更多…"));
     try {
-      const payload = await api.search(box.word, box.page + 1, box.order, box.searchType);
+      const requested = box.page + 1;
+      const payload = await api.search(box.word, requested, box.order, box.searchType);
       if (gen !== box.gen) return false;
-      box.page = Number(payload.page) || box.page + 1;
+      // Advance locally first: an echoed page number that is missing or stale would pin
+      // the cursor, refetch the same page forever, and look like the list had ended.
+      box.page = Math.max(requested, Number(payload.page) || 0);
       if (Number(payload.total)) box.total = Number(payload.total);
       const added = appendItems(payload.items);
       updateCount();
       foot.replaceChildren();
       if (!added) {
-        finishList();
-        return false;
+        // One page with nothing new is not proof of the end: a repeated or thin page can
+        // happen mid-list. Only give up when the cursor has also reached the last page
+        // the announced total implies, or when two empty pages arrive in a row.
+        box.emptyPages += 1;
+        const lastPage = box.total > 0 ? Math.ceil(box.total / Math.max(1, box.pageSize)) : Infinity;
+        if (box.emptyPages >= 2 || (Number.isFinite(lastPage) && box.page >= lastPage)) {
+          finishList();
+          return false;
+        }
+        pump();
+        return true;
       }
+      box.emptyPages = 0;
+      if (payload.items && payload.items.length) box.pageSize = payload.items.length;
       if (box.total > 0 && box.seen.size >= box.total) {
         finishList();
         return false;
@@ -645,6 +649,7 @@ export async function renderSearch(view, ctx) {
   }
 
   return function cleanup() {
+    grid.destroy();
     clearTimeout(box.timer);
     if (box.renderFrame) { cancelAnimationFrame(box.renderFrame); box.renderFrame = 0; }
     box.renderToken += 1;

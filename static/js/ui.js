@@ -352,6 +352,7 @@ export function coverCanvas(src, options) {
 
   let finished = false;
   let observer = null;
+  let retryTimer = 0;
   let attempts = 0;
 
   function finish() {
@@ -380,7 +381,11 @@ export function coverCanvas(src, options) {
       finish();
       return;
     }
-    setTimeout(show, Math.min(2500, 300 * attempts));
+    clearTimeout(retryTimer);
+    retryTimer = setTimeout(() => {
+      retryTimer = 0;
+      show();
+    }, Math.min(2500, 300 * attempts));
   });
 
   function show() {
@@ -423,19 +428,8 @@ export function coverCanvas(src, options) {
 
   function start() {
     if (finished) return;
-    if (typeof IntersectionObserver === "function" && !observer) {
-      observer = new IntersectionObserver((entries) => {
-        entries.forEach((entry) => {
-          if (!entry.isIntersecting) return;
-          observer.disconnect();
-          observer = null;
-          if (aid) coverBatch.add(aid, size, tile);
-          else show();
-        });
-      }, { rootMargin: "360px 0px" });
-      observer.observe(holder);
-      return;
-    }
+    // Browse keeps a bounded page window, so enqueue covers immediately. The server
+    // still limits network concurrency; the viewport must not control cache progress.
     if (aid) coverBatch.add(aid, size, tile);
     else show();
   }
@@ -444,6 +438,10 @@ export function coverCanvas(src, options) {
 
   holder.__cancel = () => {
     finished = true;
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = 0;
+    }
     if (observer) observer.disconnect();
     observer = null;
     coverBatch.forget(tile);
@@ -457,6 +455,8 @@ export function coverCanvas(src, options) {
 // Views unmount without telling their tiles; a navigation is the natural reset point.
 export function resetCoverStream() {
   coverBatch.clear();
+  coverWarmQueue.length = 0;
+  coverWarmSeen.clear();
 }
 
 // Called when a frozen page is shown again (see app.js embed mode).
